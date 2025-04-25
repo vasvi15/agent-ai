@@ -1,0 +1,11 @@
+# Deep Research AI Agentic System Requirements
+langchain>=0.1.0
+langchain-core>=0.1.5
+langchain-openai>=0.0.2
+langchain-community>=0.0.10
+langgraph>=0.0.15
+nest-asyncio>=1.5.8
+pydantic>=2.4.0
+python-dotenv>=1.0.0
+openai>=1.3.0
+tavily-python>=0.2.6
