@@ -1,0 +1,514 @@
+# Deep Research AI Agentic System
+# A multi-agent system using LangGraph and LangChain with Tavily integration
+
+import os
+import uuid
+from typing import Dict, List, Any, Optional, Tuple
+from enum import Enum
+from datetime import datetime
+
+import nest_asyncio
+nest_asyncio.apply()
+
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.output_parsers import JsonOutputParser
+from langchain_core.pydantic_v1 import BaseModel, Field
+from langchain_core.runnables import RunnablePassthrough
+from langchain_openai import ChatOpenAI
+from langchain_community.tools.tavily_search import TavilySearchResults
+from langgraph.graph import StateGraph, END
+from langgraph.prebuilt import ToolNode
+
+# Configuration
+class Config:
+    OPENAI_MODEL = "gpt-4-turbo"
+    TEMPERATURE = 0.1
+    TAVILY_MAX_RESULTS = 8
+    TAVILY_SEARCH_DEPTH = "advanced"
+    
+    # Agent configuration
+    RESEARCH_AGENT_CREATIVITY = 0.3
+    ANALYSIS_AGENT_TEMPERATURE = 0.2
+    SYNTHESIS_AGENT_TEMPERATURE = 0.4
+
+# Set your API keys
+os.environ["OPENAI_API_KEY"] = "your-openai-api-key"
+os.environ["TAVILY_API_KEY"] = "your-tavily-api-key"
+
+# Enums for agent status and research states
+class ResearchStatus(str, Enum):
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    COMPLETE = "complete"
+    FAILED = "failed"
+
+class NextStep(str, Enum):
+    RESEARCH = "research"
+    ANALYZE = "analyze"
+    SYNTHESIZE = "synthesize"
+    COMPLETE = "complete"
+
+# Models for structured data
+class SearchQuery(BaseModel):
+    query: str = Field(description="Search query to run")
+    rationale: str = Field(description="Rationale for this search query")
+
+class ResearchPlan(BaseModel):
+    main_question: str = Field(description="The main research question")
+    search_queries: List[SearchQuery] = Field(description="List of search queries to explore")
+    
+class AnalysisResult(BaseModel):
+    key_findings: List[str] = Field(description="Key findings from the research")
+    knowledge_gaps: List[str] = Field(description="Areas where more information is needed")
+    conflicting_info: List[Dict] = Field(description="Conflicting information found")
+    credibility_assessment: Dict[str, float] = Field(description="Source credibility ratings")
+
+class SourceInfo(BaseModel):
+    url: str = Field(description="URL of the source")
+    title: str = Field(description="Title of the source")
+    content_snippet: str = Field(description="Relevant content snippet")
+    
+class ResearchResult(BaseModel):
+    query: str = Field(description="The search query used")
+    sources: List[SourceInfo] = Field(description="List of sources found")
+
+# State definition for LangGraph
+class AgentState(BaseModel):
+    """State for the research agent system."""
+    question: str = Field(description="Original research question")
+    research_status: ResearchStatus = Field(default=ResearchStatus.PENDING)
+    research_plan: Optional[ResearchPlan] = Field(default=None)
+    search_results: List[ResearchResult] = Field(default_factory=list)
+    analysis_results: Optional[AnalysisResult] = Field(default=None)
+    final_answer: Optional[str] = Field(default=None)
+    next_step: NextStep = Field(default=NextStep.RESEARCH)
+    messages: List[Dict] = Field(default_factory=list)
+    errors: List[str] = Field(default_factory=list)
+
+# Create the LLM instances for each agent
+research_agent_llm = ChatOpenAI(model=Config.OPENAI_MODEL, temperature=Config.RESEARCH_AGENT_CREATIVITY)
+analysis_agent_llm = ChatOpenAI(model=Config.OPENAI_MODEL, temperature=Config.ANALYSIS_AGENT_TEMPERATURE)
+synthesis_agent_llm = ChatOpenAI(model=Config.OPENAI_MODEL, temperature=Config.SYNTHESIS_AGENT_TEMPERATURE)
+
+# Initialize the Tavily search tool
+tavily_tool = TavilySearchResults(
+    max_results=Config.TAVILY_MAX_RESULTS,
+    search_depth=Config.TAVILY_SEARCH_DEPTH,
+)
+
+# Agent prompts
+research_agent_prompt = ChatPromptTemplate.from_messages([
+    SystemMessage(content="""You are the Research Agent, responsible for planning and executing research strategies.
+Given a research question, your job is to:
+1. Break down the question into specific search queries that will yield comprehensive information
+2. Create a structured research plan
+3. Execute searches using the Tavily search tool
+4. Keep track of the information gathered
+
+Be thorough, creative, and strategic in your approach. Consider different perspectives and angles to explore.
+"""),
+    MessagesPlaceholder(variable_name="messages"),
+    HumanMessage(content="""
+Research Question: {question}
+
+Your task is to create a comprehensive research plan and execute it.
+If you have a research plan already, continue executing it.
+Current state: {current_state}
+
+Respond with:
+1. Your assessment of the current research state
+2. Your next actions (create plan or execute searches)
+3. Any adjustments needed to the research approach
+""")
+])
+
+analysis_agent_prompt = ChatPromptTemplate.from_messages([
+    SystemMessage(content="""You are the Analysis Agent, responsible for critically analyzing research findings.
+Your job is to:
+1. Identify key findings and insights from the search results
+2. Assess the credibility and relevance of sources
+3. Identify knowledge gaps that need further exploration
+4. Note any conflicting information across sources
+5. Organize the information in a structured way for synthesis
+
+Be analytical, critical, and thorough. Question assumptions and evaluate the quality of information.
+"""),
+    MessagesPlaceholder(variable_name="messages"),
+    HumanMessage(content="""
+Research Question: {question}
+Research Plan: {research_plan}
+Search Results: {search_results}
+
+Your task is to analyze these findings.
+Current state: {current_state}
+
+Provide a comprehensive analysis that:
+1. Summarizes key findings
+2. Identifies knowledge gaps
+3. Highlights conflicting information
+4. Assesses source credibility
+""")
+])
+
+synthesis_agent_prompt = ChatPromptTemplate.from_messages([
+    SystemMessage(content="""You are the Synthesis Agent, responsible for creating a final comprehensive answer.
+Your job is to:
+1. Integrate the analyzed information into a coherent narrative
+2. Structure the answer logically and clearly
+3. Ensure all claims are supported by the research
+4. Include proper citations to sources
+5. Address the original question fully
+
+Be clear, authoritative, and accurate. Explain complex concepts in accessible language while maintaining precision.
+"""),
+    MessagesPlaceholder(variable_name="messages"),
+    HumanMessage(content="""
+Original Question: {question}
+Analysis Results: {analysis_results}
+Search Results (for citations): {search_results}
+
+Your task is to synthesize a comprehensive answer.
+Current state: {current_state}
+
+Create a well-structured response that:
+1. Directly answers the original question
+2. Integrates all relevant findings
+3. Acknowledges limitations or uncertainties
+4. Includes proper citations
+""")
+])
+
+# Agent functions
+async def research_agent(state: AgentState) -> AgentState:
+    """Research agent function for planning and executing searches."""
+    try:
+        # Prepare messages history
+        messages = state.messages.copy()
+        
+        # Run the research agent
+        response = await research_agent_llm.ainvoke(
+            research_agent_prompt.format(
+                question=state.question,
+                current_state={
+                    "research_status": state.research_status,
+                    "research_plan": state.research_plan.dict() if state.research_plan else None,
+                    "search_results_count": len(state.search_results)
+                },
+                messages=messages
+            )
+        )
+        
+        # Add response to messages
+        messages.append({"role": "assistant", "content": response.content})
+        state.messages = messages
+        
+        # If we don't have a research plan yet, create one
+        if state.research_plan is None:
+            # Parse research plan using the LLM
+            plan_parser_prompt = ChatPromptTemplate.from_messages([
+                SystemMessage(content="Extract a structured research plan from the following text. Return it as a JSON object."),
+                HumanMessage(content=response.content)
+            ])
+            
+            plan_parser = JsonOutputParser(pydantic_object=ResearchPlan)
+            chain = plan_parser_prompt | research_agent_llm | plan_parser
+            
+            try:
+                research_plan = await chain.ainvoke({"text": response.content})
+                state.research_plan = research_plan
+                state.research_status = ResearchStatus.IN_PROGRESS
+            except Exception as e:
+                state.errors.append(f"Failed to parse research plan: {str(e)}")
+                # Create a simple default plan
+                main_question = state.question
+                state.research_plan = ResearchPlan(
+                    main_question=main_question,
+                    search_queries=[SearchQuery(query=main_question, rationale="Direct search for the main question")]
+                )
+        
+        # Execute searches if we have a plan
+        if state.research_plan and state.research_status == ResearchStatus.IN_PROGRESS:
+            # Get queries that haven't been searched yet
+            existing_queries = {r.query for r in state.search_results}
+            new_queries = [q for q in state.research_plan.search_queries 
+                          if q.query not in existing_queries][:3]  # Limit to 3 per iteration
+            
+            for query in new_queries:
+                try:
+                    # Execute Tavily search
+                    search_results = await tavily_tool.ainvoke({"query": query.query})
+                    
+                    # Format the results
+                    sources = []
+                    for result in search_results:
+                        sources.append(SourceInfo(
+                            url=result.get("url", ""),
+                            title=result.get("title", ""),
+                            content_snippet=result.get("content", "")
+                        ))
+                    
+                    state.search_results.append(ResearchResult(
+                        query=query.query,
+                        sources=sources
+                    ))
+                except Exception as e:
+                    state.errors.append(f"Search error for query '{query.query}': {str(e)}")
+        
+        # Determine next step
+        if len(state.search_results) >= len(state.research_plan.search_queries):
+            state.research_status = ResearchStatus.COMPLETE
+            state.next_step = NextStep.ANALYZE
+        else:
+            state.next_step = NextStep.RESEARCH
+            
+        return state
+    
+    except Exception as e:
+        state.errors.append(f"Research agent error: {str(e)}")
+        state.research_status = ResearchStatus.FAILED
+        state.next_step = NextStep.COMPLETE  # Skip to end on critical failure
+        return state
+
+async def analysis_agent(state: AgentState) -> AgentState:
+    """Analysis agent function for processing search results."""
+    try:
+        # Prepare messages history
+        messages = state.messages.copy()
+        
+        # Run the analysis agent
+        response = await analysis_agent_llm.ainvoke(
+            analysis_agent_prompt.format(
+                question=state.question,
+                research_plan=state.research_plan.dict() if state.research_plan else {},
+                search_results=state.search_results,
+                current_state={
+                    "research_status": state.research_status,
+                    "analysis_results": state.analysis_results.dict() if state.analysis_results else None
+                },
+                messages=messages
+            )
+        )
+        
+        # Add response to messages
+        messages.append({"role": "assistant", "content": response.content})
+        state.messages = messages
+        
+        # Parse analysis results
+        analysis_parser_prompt = ChatPromptTemplate.from_messages([
+            SystemMessage(content="Extract structured analysis results from the following text. Return it as a JSON object."),
+            HumanMessage(content=response.content)
+        ])
+        
+        analysis_parser = JsonOutputParser(pydantic_object=AnalysisResult)
+        chain = analysis_parser_prompt | analysis_agent_llm | analysis_parser
+        
+        try:
+            analysis_results = await chain.ainvoke({"text": response.content})
+            state.analysis_results = analysis_results
+        except Exception as e:
+            state.errors.append(f"Failed to parse analysis results: {str(e)}")
+            # Create default analysis
+            state.analysis_results = AnalysisResult(
+                key_findings=["Analysis parsing failed, using raw content instead"],
+                knowledge_gaps=["Unable to determine knowledge gaps"],
+                conflicting_info=[],
+                credibility_assessment={}
+            )
+        
+        # Set next step
+        state.next_step = NextStep.SYNTHESIZE
+        return state
+    
+    except Exception as e:
+        state.errors.append(f"Analysis agent error: {str(e)}")
+        state.next_step = NextStep.SYNTHESIZE  # Try to continue anyway
+        return state
+
+async def synthesis_agent(state: AgentState) -> AgentState:
+    """Synthesis agent function for creating final answers."""
+    try:
+        # Prepare messages history
+        messages = state.messages.copy()
+        
+        # Run the synthesis agent
+        response = await synthesis_agent_llm.ainvoke(
+            synthesis_agent_prompt.format(
+                question=state.question,
+                analysis_results=state.analysis_results.dict() if state.analysis_results else {},
+                search_results=state.search_results,
+                current_state={
+                    "research_status": state.research_status,
+                },
+                messages=messages
+            )
+        )
+        
+        # Add response to messages
+        messages.append({"role": "assistant", "content": response.content})
+        state.messages = messages
+        
+        # Set final answer
+        state.final_answer = response.content
+        state.next_step = NextStep.COMPLETE
+        
+        return state
+    
+    except Exception as e:
+        state.errors.append(f"Synthesis agent error: {str(e)}")
+        state.next_step = NextStep.COMPLETE
+        return state
+
+# Router function to determine next step
+def router(state: AgentState) -> str:
+    """Route to the next step based on state."""
+    return state.next_step.value
+
+# Build the graph
+async def build_research_graph():
+    """Build the research workflow graph."""
+    # Create the graph
+    workflow = StateGraph(AgentState)
+    
+    # Add nodes
+    workflow.add_node("research", research_agent)
+    workflow.add_node("analyze", analysis_agent)
+    workflow.add_node("synthesize", synthesis_agent)
+    
+    # Add edges
+    workflow.add_edge("research", router)
+    workflow.add_edge("analyze", router)
+    workflow.add_edge("synthesize", router)
+    
+    # Set conditionals
+    workflow.add_conditional_edges(
+        "research",
+        router,
+        {
+            NextStep.RESEARCH.value: "research",
+            NextStep.ANALYZE.value: "analyze",
+            NextStep.SYNTHESIZE.value: "synthesize",
+            NextStep.COMPLETE.value: END
+        }
+    )
+    
+    workflow.add_conditional_edges(
+        "analyze",
+        router,
+        {
+            NextStep.RESEARCH.value: "research",
+            NextStep.SYNTHESIZE.value: "synthesize",
+            NextStep.COMPLETE.value: END
+        }
+    )
+    
+    workflow.add_conditional_edges(
+        "synthesize",
+        router,
+        {
+            NextStep.RESEARCH.value: "research",
+            NextStep.ANALYZE.value: "analyze",
+            NextStep.COMPLETE.value: END
+        }
+    )
+    
+    # Compile the graph
+    return workflow.compile()
+
+# Main class for the Deep Research System
+class DeepResearchSystem:
+    """Main class for the Deep Research AI Agentic System."""
+    
+    def __init__(self):
+        """Initialize the Deep Research System."""
+        self.research_id = str(uuid.uuid4())
+        self.graph = None
+        self.initialized = False
+    
+    async def initialize(self):
+        """Initialize the system components."""
+        if not self.initialized:
+            self.graph = await build_research_graph()
+            self.initialized = True
+    
+    async def research(self, question: str) -> Dict[str, Any]:
+        """Execute a research task with the given question."""
+        if not self.initialized:
+            await self.initialize()
+        
+        # Initialize state
+        state = AgentState(
+            question=question,
+            research_status=ResearchStatus.PENDING,
+            next_step=NextStep.RESEARCH
+        )
+        
+        # Start time
+        start_time = datetime.now()
+        
+        # Execute the graph
+        result = None
+        async for event in self.graph.astream(state):
+            result = event
+        
+        # End time
+        end_time = datetime.now()
+        duration = (end_time - start_time).total_seconds()
+        
+        # Prepare final result
+        if result:
+            final_state = result.values[0]
+            
+            return {
+                "research_id": self.research_id,
+                "question": question,
+                "answer": final_state.final_answer,
+                "sources": [{"url": source.url, "title": source.title} 
+                           for result in final_state.search_results 
+                           for source in result.sources],
+                "stats": {
+                    "duration_seconds": duration,
+                    "queries_executed": len(final_state.search_results),
+                    "sources_found": sum(len(result.sources) for result in final_state.search_results),
+                    "errors": final_state.errors
+                }
+            }
+        else:
+            return {
+                "research_id": self.research_id,
+                "question": question,
+                "answer": "Research failed to complete",
+                "sources": [],
+                "stats": {
+                    "duration_seconds": duration,
+                    "errors": ["Research workflow failed to return a result"]
+                }
+            }
+
+# Example usage
+async def main():
+    # Create the research system
+    system = DeepResearchSystem()
+    await system.initialize()
+    
+    # Execute a research task
+    result = await system.research("What are the latest advances in quantum computing and how might they impact cryptography?")
+    
+    print(f"Research Question: {result['question']}")
+    print("\nAnswer:")
+    print(result['answer'])
+    print("\nSources:")
+    for source in result['sources'][:5]:  # Show first 5 sources
+        print(f"- {source['title']} ({source['url']})")
+    print("\nStats:")
+    print(f"- Duration: {result['stats']['duration_seconds']:.2f} seconds")
+    print(f"- Queries: {result['stats']['queries_executed']}")
+    print(f"- Sources: {result['stats']['sources_found']}")
+    if result['stats']['errors']:
+        print("\nErrors encountered:")
+        for error in result['stats']['errors']:
+            print(f"- {error}")
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
